@@ -27,6 +27,106 @@ from torch_utils import custom_ops
 class UserError(Exception):
     pass
 
+# -------------------- custom setup for TPDM
+def setup_GAN_kwargs(
+    # General options (not included in desc).
+    gpus       = None, # Number of GPUs: <int>, default = 1 gpu
+    # Dataset.
+    label_dim       = 0,
+    # Base config.
+    cfg        = None, # Base config: 'auto' (default), 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar'
+    gamma      = None, # Override R1 gamma: <float>
+    nobench    = None, # Disable cuDNN benchmarking: <bool>, default = False
+):
+    args = dnnlib.EasyDict()
+    # ------------------------------------
+    # Base config: cfg, gamma, kimg, batch
+    # ------------------------------------
+
+    if cfg is None:
+        cfg = 'auto'
+    assert isinstance(cfg, str)
+
+    cfg_specs = {
+        'auto':      dict(ref_gpus=-1, kimg=25000,  mb=-1, mbstd=-1, fmaps=-1,  lrate=-1,     gamma=-1,   ema=-1,  ramp=0.05, map=2), # Populated dynamically based on resolution and GPU count.
+        'stylegan2': dict(ref_gpus=8,  kimg=25000,  mb=32, mbstd=4,  fmaps=1,   lrate=0.002,  gamma=10,   ema=10,  ramp=None, map=8), # Uses mixed-precision, unlike the original StyleGAN2.
+        'paper256':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=0.5, lrate=0.0025, gamma=1,    ema=20,  ramp=None, map=8),
+        'paper512':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=1,   lrate=0.0025, gamma=0.5,  ema=20,  ramp=None, map=8),
+        'paper1024': dict(ref_gpus=8,  kimg=25000,  mb=32, mbstd=4,  fmaps=1,   lrate=0.002,  gamma=2,    ema=10,  ramp=None, map=8),
+        'cifar':     dict(ref_gpus=2,  kimg=100000, mb=64, mbstd=32, fmaps=1,   lrate=0.0025, gamma=0.01, ema=500, ramp=0.05, map=2),
+    }
+
+    assert cfg in cfg_specs
+    spec = dnnlib.EasyDict(cfg_specs[cfg])
+    if cfg == 'auto':
+        spec.ref_gpus = gpus
+        res = args.training_set_kwargs.resolution
+        spec.mb = max(min(gpus * min(4096 // res, 32), 64), gpus) # keep gpu memory consumption at bay
+        spec.mbstd = min(spec.mb // gpus, 4) # other hyperparams behave more predictably if mbstd group size remains fixed
+        spec.fmaps = 1 if res >= 512 else 0.5
+        spec.lrate = 0.002 if res >= 1024 else 0.0025
+        spec.gamma = 0.0002 * (res ** 2) / spec.mb # heuristic formula
+        spec.ema = spec.mb * 10 / 32
+
+    args.label_dim = label_dim
+
+    args.G_kwargs = dnnlib.EasyDict(class_name='training.networks.Generator', z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict(), synthesis_kwargs=dnnlib.EasyDict())
+    args.G_kwargs.synthesis_kwargs.channel_base = int(spec.fmaps * 32768)
+    args.G_kwargs.synthesis_kwargs.channel_max = 512
+    args.G_kwargs.mapping_kwargs.num_layers = spec.map
+    args.G_kwargs.synthesis_kwargs.num_fp16_res = 4 # enable mixed-precision training
+    args.G_kwargs.synthesis_kwargs.conv_clamp = 256 # clamp activations to avoid float16 overflow
+
+    args.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=spec.lrate, betas=[0,0.99], eps=1e-8)
+    # args.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss', r1_gamma=spec.gamma)
+
+    args.total_kimg = spec.kimg
+    args.ema_kimg = spec.ema
+    args.ema_rampup = spec.ramp
+
+    if cfg == 'cifar':
+        args.loss_kwargs.pl_weight = 0 # disable path length regularization
+        args.loss_kwargs.style_mixing_prob = 0 # disable style mixing
+
+    if gamma is not None:
+        assert isinstance(gamma, float)
+        if not gamma >= 0:
+            raise UserError('--gamma must be non-negative')
+        args.loss_kwargs.r1_gamma = gamma
+
+    if nobench is None:
+        nobench = False
+    assert isinstance(nobench, bool)
+    if nobench:
+        args.cudnn_benchmark = False
+
+    return args
+
+#----------------------------------------------------------------------------
+
+def subprocess_fn(rank, args, temp_dir):
+    dnnlib.util.Logger(file_name=os.path.join(args.run_dir, 'log.txt'), file_mode='a', should_flush=True)
+
+    # Init torch.distributed.
+    if args.num_gpus > 1:
+        init_file = os.path.abspath(os.path.join(temp_dir, '.torch_distributed_init'))
+        if os.name == 'nt':
+            init_method = 'file:///' + init_file.replace('\\', '/')
+            torch.distributed.init_process_group(backend='gloo', init_method=init_method, rank=rank, world_size=args.num_gpus)
+        else:
+            init_method = f'file://{init_file}'
+            torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=args.num_gpus)
+
+    # Init torch_utils.
+    sync_device = torch.device('cuda', rank) if args.num_gpus > 1 else None
+    training_stats.init_multiprocessing(rank=rank, sync_device=sync_device)
+    if rank != 0:
+        custom_ops.verbosity = 'none'
+
+    # Execute training loop.
+    training_loop.training_loop(rank=rank, **args)
+
+
 #----------------------------------------------------------------------------
 
 def setup_training_loop_kwargs(
